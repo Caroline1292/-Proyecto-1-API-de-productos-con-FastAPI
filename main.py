@@ -2,13 +2,15 @@
 Titulo: Proyecto tiendita
 Autor: Carolina Ruiz Gudiño
 Descripción: Configuración de la API para gestión de inventario.
-Fecha: 14-octubre-2026
+Fecha:14-octubre-2026
 """
 
 
-from fastapi import FastAPI  #HTTPException, status
+from fastapi import FastAPI, Request  
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import asyncio
+import time
 
 
 app = FastAPI()
@@ -19,9 +21,49 @@ async def pruebaAsyncio():
     await asyncio.sleep(5)
     print("Se acaba de terminar los 5 segundos")
     return{"Message": "Respuesta después de 5 segundos"}
-    
 
 
+# MIDDLEWARE: límite de 5 peticiones por segundo (por IP)
+# Un middleware es código que se ejecuta ANTES y DESPUÉS de cada petición, sin importar a qué endpoint vaya. 
+# Aquí lo usamos para revisar cuántas peticiones ha hecho cada cliente en el último segundo.
+
+MAX_PETICIONES = 5        # Máximo de peticiones permitidas...
+VENTANA_SEGUNDOS = 1.0    # ...en este intervalo de tiempo
+
+peticiones_por_ip = {}    # Guarda: IP -> lista de horas de sus peticiones
+candado = asyncio.Lock()  # Evita que dos peticiones modifiquen el diccionario al mismo tiempo
+
+
+@app.middleware("http")
+async def limitarPeticiones(request: Request, call_next):
+    ip = request.client.host if request.client else "desconocida"
+
+    # Solo una petición a la vez puede entrar a esta sección (asyncio.Lock)
+    async with candado:
+        ahora = time.monotonic()
+
+        # Nos quedamos solo con las peticiones del último segundo
+        recientes = [t for t in peticiones_por_ip.get(ip, []) if ahora - t < VENTANA_SEGUNDOS]
+
+        # Si ya hizo 5 en el último segundo, la rechazamos con error 429
+        if len(recientes) >= MAX_PETICIONES:
+            peticiones_por_ip[ip] = recientes
+            return JSONResponse(
+                status_code=429,
+                content={"Message": "Demasiadas peticiones. Máximo 5 por segundo."}
+            )
+
+        # Si no, registramos esta petición
+        recientes.append(ahora)
+        peticiones_por_ip[ip] = recientes
+
+    # La petición sigue su camino hacia el endpoint (await = esperamos su respuesta)
+    respuesta = await call_next(request)
+    return respuesta
+
+
+# CORS se agrega DESPUÉS del limitador para que quede "por fuera":
+# así hasta la respuesta 429 lleva los permisos CORS y el navegador la puede leer.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,11 +91,16 @@ def home():
         #return {"Error": "Hubo un error (error)"}
 
 #GET Obtiene lista de productos de mi inventario
+# Endpoint async SIN await: leer una lista en memoria es inmediato, no hay nada que esperar (ni archivos, ni red, ni base de datos).
+# Si el inventario estuviera en una base de datos aquí iría algo como:
+#   productos = await db.obtener_productos()
 @app.get("/productos")
 async def getProductos():
     return inventario
 
 #POST Agrega producto a mi inventario
+# Endpoint async CON await: simulamos el tiempo que tardaría guardar en una base de datos. Mientras esta función espera, el servidor
+# puede seguir atendiendo otras peticiones (no se bloquea).
 @app.post("/productos")
 async def addProducto(producto: dict):
 
@@ -73,6 +120,7 @@ async def addProducto(producto: dict):
     return inventario
 
 #DELETE Borrar producto de mi inventario
+# Endpoint async CON await: simulamos el tiempo que tardaría borrar el registro en una base de datos.
 @app.delete("/productos/{producto_id}")
 async def deleteProducto(producto_id: int):
 
