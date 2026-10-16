@@ -6,7 +6,7 @@ Fecha:14-octubre-2026
 """
 
 
-from fastapi import FastAPI, Request  
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import asyncio
@@ -132,4 +132,41 @@ async def deleteProducto(producto_id: int):
             inventario.remove(producto)
             return {"Message": "El producto fue eliminado"}
     return {"Message": "No fue encontrado el producto"}
-  
+
+
+# ---------------------------------------------------------------------
+# POST Comprar un producto (resta 1 a su cantidad)
+# ---------------------------------------------------------------------
+# Este endpoint se prueba con Locust: muchos clientes intentan comprar
+# el mismo producto al mismo tiempo.
+#
+# Problema (condición de carrera): si dos compras revisan la cantidad al
+# mismo tiempo, las dos pueden ver "queda 1" y las dos restan, dejando el
+# stock en -1 (se vendió algo que ya no había).
+#
+# Solución: asyncio.Lock. Solo una compra a la vez puede entrar al bloque
+# "async with"; las demás esperan su turno sin bloquear el servidor.
+candado_inventario = asyncio.Lock()
+
+@app.post("/productos/{producto_id}")
+async def comprarProducto(producto_id: int):
+    async with candado_inventario:
+        for producto in inventario:
+            if producto["id"] == producto_id:
+                if producto["cantidad"] <= 0:
+                    # 400 = el cliente pidió algo que no se puede hacer
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="No hay stock de ese producto"
+                    )
+
+                # Simula el tiempo de guardar la venta en una base de datos
+                await asyncio.sleep(0.05)
+                producto["cantidad"] = producto["cantidad"] - 1
+                return {"Message": "Producto comprado", "quedan": producto["cantidad"]}
+
+    # 404 = no existe un producto con ese id
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="No existe el producto con ese id"
+    )
