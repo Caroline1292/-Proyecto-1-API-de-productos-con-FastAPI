@@ -34,7 +34,9 @@ peticiones_por_ip = {}    # Guarda: IP -> lista de horas de sus peticiones
 candado = asyncio.Lock()  # Evita que dos peticiones modifiquen el diccionario al mismo tiempo
 
 
-@app.middleware("http")
+# PROYECTO 2: middleware desactivado. Con 100 usuarios de Locust desde la misma IP 
+# bloquearía casi todo con 429 y no se podría observar la condición de carrera.
+#@app.middleware("http")
 async def limitarPeticiones(request: Request, call_next):
     ip = request.client.host if request.client else "desconocida"
 
@@ -76,7 +78,7 @@ app.add_middleware(
 inventario = [
     {"id": 1, "nombre": "Coca-Cola", "precio": 20, "cantidad": 25},
     {"id": 2, "nombre": "Papas", "precio": 15, "cantidad": 40},
-    {"id": 3, "nombre": "Café", "precio": 18, "cantidad": 15}
+    {"id": 3, "nombre": "Café", "precio": 18, "cantidad": 1}
 ]
 
 #ejemplo de API - GET para obtener mensaje inicial
@@ -134,39 +136,57 @@ async def deleteProducto(producto_id: int):
     return {"Message": "No fue encontrado el producto"}
 
 
-# ---------------------------------------------------------------------
-# POST Comprar un producto (resta 1 a su cantidad)
-# ---------------------------------------------------------------------
-# Este endpoint se prueba con Locust: muchos clientes intentan comprar
-# el mismo producto al mismo tiempo.
-#
-# Problema (condición de carrera): si dos compras revisan la cantidad al
-# mismo tiempo, las dos pueden ver "queda 1" y las dos restan, dejando el
-# stock en -1 (se vendió algo que ya no había).
-#
-# Solución: asyncio.Lock. Solo una compra a la vez puede entrar al bloque
-# "async with"; las demás esperan su turno sin bloquear el servidor.
-candado_inventario = asyncio.Lock()
-
-@app.post("/productos/{producto_id}")
-async def comprarProducto(producto_id: int):
-    async with candado_inventario:
-        for producto in inventario:
-            if producto["id"] == producto_id:
-                if producto["cantidad"] <= 0:
-                    # 400 = el cliente pidió algo que no se puede hacer
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="No hay stock de ese producto"
-                    )
-
-                # Simula el tiempo de guardar la venta en una base de datos
-                await asyncio.sleep(0.05)
-                producto["cantidad"] = producto["cantidad"] - 1
-                return {"Message": "Producto comprado", "quedan": producto["cantidad"]}
-
-    # 404 = no existe un producto con ese id
+#GET Obtiene un solo producto por su id (para verificar el stock del Café)
+@app.get("/productos/{producto_id}")
+async def getProducto(producto_id: int):
+    for producto in inventario:
+        if producto["id"] == producto_id:
+            return producto
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail="No existe el producto con ese id"
     )
+
+
+# ---------------------------------------------------------------------
+# POST Comprar un producto (Proyecto 2)
+# ---------------------------------------------------------------------
+# Condición de carrera: si varios clientes compran al mismo tiempo, todos
+# pueden leer "cantidad > 0" antes de que alguno reste, y el stock queda negativo.
+# Solución: asyncio.Lock. Solo una compra a la vez entra a la sección crítica.
+#
+# Experimento A (sin lock): comentar la línea "async with lock:"
+# Experimento B (con lock): descomentarla
+lock = asyncio.Lock()
+
+@app.post("/productos/{producto_id}")
+async def comprarProducto(producto_id: int):
+    try:
+        async with lock:  # Punto de control del experimento
+            for objeto in inventario:
+                if objeto["id"] == producto_id:
+                    if objeto["cantidad"] > 0:
+                        await asyncio.sleep(0.05)  # Latencia simulada de base de datos
+                        objeto["cantidad"] = objeto["cantidad"] - 1
+                        return {"mensaje": "Producto comprado"}
+                    else:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="No hay stock de ese producto"
+                        )
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No existe el ID de ese producto"
+            )
+
+    # Los errores 400 (no hay stock) se dejan pasar tal cual,
+    # para que no se conviertan en error 500 en el except de abajo.
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al comprar producto: {str(error)}"
+        )
